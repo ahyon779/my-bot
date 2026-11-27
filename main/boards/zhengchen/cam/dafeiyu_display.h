@@ -44,7 +44,7 @@ public:
 
     void SetupUI() override;
     void SetStatus(const char* status) override;
-    void SetEmotion(const char* emotion) override;
+    bool SetEmotion(const char* emotion) override;  // my-bot: 官方 6.x 基类返回 bool
     void SetChatMessage(const char* role, const char* content) override;
     void ClearChatMessages() override;
     void SetEmojiCollection(std::shared_ptr<EmojiCollection> collection) override;

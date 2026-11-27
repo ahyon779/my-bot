@@ -17,6 +17,8 @@ public:
     void SetBool(const std::string& key, bool value);
     void EraseKey(const std::string& key);
     void EraseAll();
+    // my-bot: zhengchen/cam 增量代码显式调用；官方析构时已自动提交，这里立即落盘
+    void Commit();
 
 private:
     std::string ns_;

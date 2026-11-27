@@ -62,6 +62,8 @@ public:
     virtual void SetupUI() { setup_ui_called_ = true; }
     virtual bool IsMonochrome() const { return false; }
     virtual bool SupportsGuiOperations() const { return false; }
+    // my-bot: 模式选择列表是否激活（zhengchen/cam 的开机菜单用；其他板返回 false）
+    virtual bool IsModeSelectActive() const { return false; }
     virtual void SetHideSubtitle(bool hide) { (void)hide; }
     virtual bool InsertAnimDialog(const char* name, uint32_t duration_ms) {
         (void)name;

@@ -868,7 +868,8 @@ elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_CAM)
     set(BOARD_DIR "zhengchen/cam")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
-    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    # my-bot: 大飞鱼角色素材（assets/dafeiyu/*.gif 占位图）
+    set(DEFAULT_EMOJI_COLLECTION dafeiyu)
 elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_CAM_ML307)
     set(BOARD_DIR "zhengchen/cam-ml307")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -1020,9 +1021,10 @@ if(BOARD_DIR STREQUAL "zhengchen/cam")
         "orb/orb_lvgl.c"
     )
     list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/orb")
-    # 如需恢复大飞鱼 21 情绪全屏动画，需从上游取回 assets/dafeiyu/*.gif
-    # 与 _emotes/ _themes/ 资源（S3-car 仓库未提交这些二进制资源），
-    # 然后把 DEFAULT_EMOJI_COLLECTION 改为 dafeiyu 并追加对应源文件。
+    # 角色立绘引擎（_emotes/*、_themes/*）的原始素材作者未提交 GitHub。
+    # my-bot 用板目录下的 pet_*.h + pet_themes_stub.cc 提供可编译的兼容实现；
+    # 真正的 21 种表情由 RoboFace（xiaozhi_face_tft.h）LVGL 自绘承担，无需 GIF。
+    # assets/dafeiyu/*.gif 是程序生成的占位图（见该目录 README.md）。
 endif()
 
 # Select one audio engine for each chip family
@@ -1450,9 +1452,16 @@ function(build_default_assets_bin)
     # Add default emoji collection if defined
     if(DEFAULT_EMOJI_COLLECTION)
         list(APPEND BUILD_ARGS "--emoji_collection" "${DEFAULT_EMOJI_COLLECTION}")
-        file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
-            "${NOTO_FONTS_PATH}/png/${DEFAULT_EMOJI_COLLECTION}/*"
-        )
+        if(DEFAULT_EMOJI_COLLECTION STREQUAL "dafeiyu")
+            # my-bot: 项目内置角色素材（assets/dafeiyu/*.gif 占位图）
+            file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
+                "${PROJECT_DIR}/assets/dafeiyu/*"
+            )
+        else()
+            file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
+                "${NOTO_FONTS_PATH}/png/${DEFAULT_EMOJI_COLLECTION}/*"
+            )
+        endif()
         list(APPEND DEFAULT_ASSETS_DEPENDENCIES ${DEFAULT_EMOJI_FILES})
     endif()
 

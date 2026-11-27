@@ -1465,6 +1465,46 @@ void Application::SetAecMode(AecMode mode) {
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
 
+/* ==== my-bot: zhengchen/cam 小车增量兼容接口实现 ==== */
+
+void Application::SetVoiceInterruptEnabled(bool enable) {
+    voice_interrupt_enabled_ = enable;
+    Settings settings("voice", true);
+    settings.SetInt("interrupt", enable ? 1 : 0);
+    settings.Commit();  // 不落盘重启会丢
+    // 打断开 = 设备端 AEC 必须开；关 = AEC 关。静默切换（复用 SetAecMode 会弹通知）
+    aec_mode_ = enable ? kAecOnDeviceSide : kAecOff;
+    Schedule([this]() {
+        audio_service_.EnableDeviceAec(aec_mode_ == kAecOnDeviceSide);
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+        }
+    });
+    ESP_LOGI(TAG, "语音打断: %s（AEC 同步%s）", enable ? "开" : "关",
+             enable ? "设备端开启" : "关闭");
+}
+
+void Application::PlaySuccessSoundIfIdle() {
+    if (!success_sound_pending_) {
+        return;
+    }
+    auto display = Board::GetInstance().GetDisplay();
+    if (display != nullptr && display->IsModeSelectActive()) {
+        return;  // 模式选择列表还开着（zhengchen/cam），继续等
+    }
+    success_sound_pending_ = false;
+    Schedule([this]() { audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS); });
+}
+
+void Application::CloseAudioChannelForSuspend() {
+    Schedule([this]() {
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+            ESP_LOGW(TAG, "暂停小智：音频通道已关闭（释放 WSS/TLS 缓冲）");
+        }
+    });
+}
+
 void Application::ResetProtocol() {
     Schedule([this]() {
         if (GetDeviceState() == kDeviceStateNotifying) {

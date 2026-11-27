@@ -120,6 +120,17 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+
+    /* ==== my-bot: zhengchen/cam 小车增量兼容接口 ====
+       下面 4 个方法来自 S3-car 对框架的扩展，官方主线没有。
+       增量板级文件（dafeiyu_display/web、mcp_controller）依赖它们。 */
+    // 语音打断开关：内部同步 AEC（开=AEC设备端开，关=AEC关），写 NVS 持久化
+    void SetVoiceInterruptEnabled(bool enable);
+    bool IsVoiceInterruptEnabled() const { return voice_interrupt_enabled_; }
+    // 开机模式选择列表收起后补播启动成功音
+    void PlaySuccessSoundIfIdle();
+    // 暂停时关闭音频通道，释放 WSS/TLS 缓冲
+    void CloseAudioChannelForSuspend();
     
     /**
      * Reset protocol resources (thread-safe)
@@ -141,6 +152,8 @@ private:
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
+    bool voice_interrupt_enabled_ = true;  // my-bot: 默认允许语音打断
+    bool success_sound_pending_ = false;   // my-bot: 启动成功音延迟播报
     std::string last_error_message_;
     std::string startup_wake_word_hint_message_;
     AudioService audio_service_;

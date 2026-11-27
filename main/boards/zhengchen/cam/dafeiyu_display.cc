@@ -5181,7 +5181,7 @@ void DafeiyuDisplay::SetStatus(const char* status) {
     // 其它（时钟文本、通知等）不切动画
 }
 
-void DafeiyuDisplay::SetEmotion(const char* emotion) {
+bool DafeiyuDisplay::SetEmotion(const char* emotion) {
     DisplayLockGuard lock(this);   /* 协议任务调用，必须加锁再碰 LVGL，理由同 SetStatus */
 
     /* 2026-11-11 小车模式：以前服务端 emotion 根本到不了大眼睛（它只走
@@ -5197,7 +5197,7 @@ void DafeiyuDisplay::SetEmotion(const char* emotion) {
                开心点头、难过缩一下、生气后撤再前冲… 内部有忙窗口 + 800ms 节流。 */
             car_action::Decor(emotion);
         }
-        return;
+        return true;  // my-bot: 车模式表情已处理
     }
 
     /* 大眼睛形象：情绪直接映射成眼睛表情。
@@ -5225,25 +5225,27 @@ void DafeiyuDisplay::SetEmotion(const char* emotion) {
         UpdateEyesFace(mood);
     }
     if (emotion == nullptr || !assets_ready_) {
-        return;
+        return true;
     }
     // 正在播一次性片段（入场/情绪反应）就让它播完，别互相打断
     if (current_ != Clip::kNone && !IsLoopClip(current_)) {
-        return;
+        return true;
     }
     // 冷却：一句话里服务端可能连发好几个 emotion，不冷却就是反复插播
     if (last_reaction_ms_ != 0 && lv_tick_elaps(last_reaction_ms_) < kReactionCooldownMs) {
         ESP_LOGD(TAG, "emotion '%s' dropped (reaction cooldown %ums)", emotion,
                  kReactionCooldownMs);
-        return;
+        return false;
     }
     Clip reaction = EmotionToClip(emotion);
     if (reaction == Clip::kNone) {
-        return;
+        return true;
     }
     last_reaction_ms_ = lv_tick_get();
     ESP_LOGI(TAG, "emotion '%s' -> reaction clip", emotion);
     PlayOnce(reaction);
+    return true;
+
 }
 
 void DafeiyuDisplay::SetChatMessage(const char* role, const char* content) {

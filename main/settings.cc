@@ -18,6 +18,14 @@ Settings::~Settings() {
     }
 }
 
+// my-bot: zhengchen/cam 增量代码显式落盘（官方析构时已自动提交，这里提前）
+void Settings::Commit() {
+    if (read_write_ && dirty_ && nvs_handle_ != 0) {
+        ESP_ERROR_CHECK(nvs_commit(nvs_handle_));
+        dirty_ = false;
+    }
+}
+
 std::string Settings::GetString(const std::string& key, const std::string& default_value) {
     if (nvs_handle_ == 0) {
         return default_value;
