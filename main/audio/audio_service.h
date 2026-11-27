@@ -22,6 +22,7 @@
 #include "audio_debugger.h"
 #include "audio_engine.h"
 #include "fixed_queue.h"
+#include "lyric_parser.h"      // my-bot: LRC 歌词
 #include "ogg_demuxer.h"
 #include "protocol.h"
 
@@ -87,6 +88,9 @@ struct AudioServiceCallbacks {
     // Fired when the decode/playback queues and their in-flight work are drained.
     std::function<void(void)> on_playback_drained;
     std::function<void(uint32_t playback_id, uint32_t media_position_ms)> on_playback_progress;
+    // my-bot: 歌词行变化 (行索引, 当前行, 上一行, 下一行, 歌曲名, 歌手)；-1=前奏
+    std::function<void(int, const std::string&, const std::string&, const std::string&,
+                       const std::string&, const std::string&)> on_lyric_changed;
 };
 
 enum AudioTaskType {
@@ -148,6 +152,31 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
+
+    /* ==== my-bot: 音乐播放（去 ADF 化）==== */
+    // MP3 软解后的 PCM 塞进官方播放队列（背压：队列满时等待）
+    void PlayMusicPcm(std::vector<int16_t>& pcm);
+    // 停止音乐：停解码任务 + 清播放队列
+    void StopMusic();
+    // 播放网络 MP3（内部用 MusicPlayer 软解）；lrc 可为空
+    void PlayMusicFromUrl(const std::string& url, const std::string& lrc = "",
+                          const std::string& title = "", const std::string& artist = "");
+    bool IsMusicPlaying();
+    // 设置歌词并重置进度（下载完歌词后调用）
+    void SetLyrics(const std::string& lrc, const std::string& title, const std::string& artist);
+    // 当前歌词行文本（供显示层查询）
+    std::string GetCurrentLyricLine() const;
+    std::string GetMusicTitle() const { return music_title_; }
+    std::string GetMusicArtist() const { return music_artist_; }
+
+private:
+    void UpdateLyric(int position_ms);
+
+    // 音乐播放状态
+    std::string music_title_;
+    std::string music_artist_;
+    LyricParser music_lyric_;
+    int last_lyric_line_ = -2;
 
 private:
     AudioCodec* codec_ = nullptr;

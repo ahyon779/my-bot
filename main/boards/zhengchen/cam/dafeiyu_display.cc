@@ -41,6 +41,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 /* 主题装饰容器显隐（实现在 _themes/pet_themes.c，纯 C）。
    ApplyThemeTo / SetWakeIndicator 在文件前部就用，声明必须放这里。 */
@@ -1557,6 +1558,9 @@ void DafeiyuDisplay::OnTick() {
     ApplyModeSelectRequest();
     /* 菜单请求次之：它不依赖素材，哪怕 pet_image_ 还没就绪也要能用 */
     ApplyMenuRequest();
+    /* my-bot: LRC 歌词行由音频任务投递，统一在 LVGL 线程上屏。
+       放在 pet_image_ 判空前，歌词不依赖素材加载完成。 */
+    ApplyMusicLyricRequest();
     /* 2026-11-11 语音进入小车模式（SetChatMessage 置位）：写 NVS 落盘再重启。 */
     if (car_enter_req_) {
         car_enter_req_ = false;
@@ -3722,6 +3726,11 @@ void DafeiyuDisplay::SetMusicPlaying(bool on) {
     DisplayLockGuard lock(this);
     music_playing_ = on;
     if (!on) {
+        {
+            std::lock_guard<std::mutex> lyric_lock(music_lyric_mutex_);
+            pending_music_lyric_ = false;
+            pending_music_lyric_text_.clear();
+        }
         if (song_label_ != nullptr) {
             song_until_ms_ = 0;
             lv_obj_add_flag(song_label_, LV_OBJ_FLAG_HIDDEN);
@@ -3735,6 +3744,68 @@ void DafeiyuDisplay::SetMusicPlaying(bool on) {
     /* 2026-11-06：放歌期间把 LVGL 刷新降到 20fps（见 ApplyRefrPeriod） */
     ApplyRefrPeriod();
     ESP_LOGI(TAG, "音乐播放状态: %s", on ? "开始" : "停止");
+}
+
+/* my-bot 去 ADF 化音乐：AudioService 在起播/歌词补全时调用。
+   歌名条沿用 SetSongTitle 的 20 秒兜底；music_playing_ 为真时不倒计时。 */
+void DafeiyuDisplay::SetMusicTitle(const std::string& title, const std::string& artist) {
+    if (title.empty() && artist.empty()) {
+        return;
+    }
+    std::string text = title;
+    if (!artist.empty()) {
+        if (!text.empty()) text += " - ";
+        text += artist;
+    }
+    SetSongTitle(text.c_str());
+}
+
+void DafeiyuDisplay::SetMusicLyric(int line, const std::string& current,
+                                   const std::string& title, const std::string& artist) {
+    (void)title;
+    (void)artist;
+    // -1 = 前奏/清行；空行也只清掉，不占位。
+    std::string text = (line < 0) ? std::string() : current;
+    if (text.size() > 159) {
+        text.resize(159);
+    }
+    std::lock_guard<std::mutex> lock(music_lyric_mutex_);
+    pending_music_lyric_text_ = std::move(text);
+    pending_music_lyric_ = true;
+}
+
+void DafeiyuDisplay::ApplyMusicLyricRequest() {
+    std::string text;
+    {
+        std::lock_guard<std::mutex> lock(music_lyric_mutex_);
+        if (!pending_music_lyric_) {
+            return;
+        }
+        text = std::move(pending_music_lyric_text_);
+        pending_music_lyric_ = false;
+    }
+    // 音乐没在放：丢掉过期歌词，避免下次起播瞬间闪出上一首的某一行。
+    if (!music_playing_) {
+        return;
+    }
+    if (subtitle_label_ == nullptr) {
+        return;
+    }
+    if (text.empty()) {
+        lv_obj_add_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    auto theme = static_cast<LvglTheme*>(GetTheme());
+    if (theme != nullptr) {
+        auto tf = theme->text_font();
+        if (tf != nullptr && tf->font() != nullptr) {
+            lv_obj_set_style_text_font(subtitle_label_, tf->font(), 0);
+        }
+    }
+    lv_label_set_text(subtitle_label_, text.c_str());
+    lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(subtitle_label_);
+    subtitle_until_ms_ = 0;
 }
 
 void DafeiyuDisplay::UpdateIpLabel() {

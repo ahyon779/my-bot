@@ -3,6 +3,8 @@
 #include <wifi_manager.h>
 
 #include <cstring>
+#include <cstdlib>
+#include <cctype>
 #include <string>
 
 #include "application.h"
@@ -14,8 +16,243 @@
 #include "display.h"
 #include "esp_now_link.h" // self.car.distance：距离保护阈值下发（ESP-NOW → C3 从机）
 #include "ws2812_led.h"   // self.led.control：板载彩灯（语音开关/颜色/律动）
+#include "audio/audio_service.h"  // my-bot: 音乐播放
 
 #define TAG "MCPController"
+
+// ===== my-bot: Meting 点歌 helper（从 xiaozhimusic 移植，纯 HTTP+JSON，无 ADF）=====
+// URL编码函数（静态函数，避免重复定义）
+static std::string url_encode(const std::string& str) {
+    std::string result;
+    for (char c : str) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            result += c;
+        } else {
+            char hex[4];
+            snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)c);
+            result += hex;
+        }
+    }
+    return result;
+}
+
+// ============ Meting 公共音源（网易云，返回完整版 MP3）============
+// 分两个职责，实测各有所长：
+//   1) 搜索用 met.liiiu.cn：稳定（实测 8/8 命中，含歌手名），无速率限制。
+//      但它的直链对部分歌曲只给 30 秒试听，且忽略 br 参数。
+//   2) 直链/歌词用 api.qijieya.cn：返回完整版（320kbps/200+秒），br 有效。
+//      但它的 search 接口有速率限制，连续请求几次后返回空数组（这就是"搜不到歌"的根因）。
+// 因此：用 liiiu 搜索拿到网易云歌曲 id，再用 qijieya 取完整版直链和歌词。
+static const char* METING_SEARCH_BASE   = "https://met.liiiu.cn/meting/api";
+static const char* METING_SEARCH_BACKUP = "https://api.qijieya.cn/meting/";
+static const char* METING_STREAM_BASE   = "https://api.qijieya.cn/meting/";
+
+// 从 Meting 的 url 字段提取歌曲 id，形如 ...server=netease&type=url&id=259138[&br=320]
+static std::string extract_meting_id(const char* url) {
+    if (url == nullptr) return "";
+    const char* p = strstr(url, "id=");
+    if (p == nullptr) return "";
+    p += 3;
+    std::string id;
+    while (*p >= '0' && *p <= '9') {
+        id.push_back(*p);
+        ++p;
+    }
+    return id;
+}
+
+// 兼容不同 Meting 实例的字段名：qijieya 用 name/artist，liiiu 用 title/author
+static std::string json_first_string(cJSON* item, const char* key1, const char* key2) {
+    cJSON* v = cJSON_GetObjectItem(item, key1);
+    if (cJSON_IsString(v) && v->valuestring && v->valuestring[0] != '\0') return v->valuestring;
+    if (key2 != nullptr) {
+        v = cJSON_GetObjectItem(item, key2);
+        if (cJSON_IsString(v) && v->valuestring && v->valuestring[0] != '\0') return v->valuestring;
+    }
+    return "";
+}
+
+// 请求某个 Meting 实例的搜索接口，返回 cJSON 数组（调用方负责 cJSON_Delete）；失败或空返回 nullptr
+static cJSON* meting_search(NetworkInterface* network, const char* base, const std::string& encoded_keyword) {
+    std::string search_url = std::string(base) + "?server=netease&type=search&id=" +
+                             encoded_keyword + "&limit=5";
+    auto http = network->CreateHttp(0);
+    if (!http->Open("GET", search_url)) {
+        http->Close();
+        ESP_LOGW(TAG, "Meting search open failed: %s", base);
+        return nullptr;
+    }
+    std::string response = http->ReadAll();
+    http->Close();
+    cJSON* root = cJSON_Parse(response.c_str());
+    if (root == nullptr || !cJSON_IsArray(root)) {
+        if (root) cJSON_Delete(root);
+        ESP_LOGW(TAG, "Meting search non-array from %s: %.80s", base, response.c_str());
+        return nullptr;
+    }
+    int n = cJSON_GetArraySize(root);
+    if (n <= 0) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "Meting search empty from %s", base);
+        return nullptr;
+    }
+    ESP_LOGI(TAG, "Meting search via %s -> %d results", base, n);
+    return root;
+}
+
+// 通过 Meting 的 type=url 接口解析出真实可播放的 MP3 直链。
+// api_url 形如：https://api.qijieya.cn/meting/?server=netease&type=url&id=259138
+// 追加 &br=320 后请求（高码率提升音质），读取 302 的 Location 头得到最终直链。失败返回空串。
+static std::string resolve_meting_url(NetworkInterface* network, const std::string& api_url) {
+    std::string url = api_url + "&br=320";
+    auto http = network->CreateHttp(0);
+    std::string location;
+    if (http->Open("GET", url)) {
+        auto status = http->GetStatusCode();
+        if (!status) {
+            ESP_LOGW(TAG, "Meting url resolve status error: %s",
+                     status.error().ToString().c_str());
+        } else {
+            ESP_LOGI(TAG, "Meting url resolve status=%d", *status);
+            // 3xx 均视为重定向；部分实例直接 200 返回 JSON {"url": "..."} 作为兜底
+            if (*status >= 300 && *status < 400) {
+                location = http->GetResponseHeader("Location");
+            } else if (*status == 200) {
+                std::string body = http->ReadAll();
+                cJSON* j = cJSON_Parse(body.c_str());
+                if (j) {
+                    cJSON* u = cJSON_GetObjectItem(j, "url");
+                    if (cJSON_IsString(u) && u->valuestring) location = u->valuestring;
+                    cJSON_Delete(j);
+                }
+            }
+        }
+    }
+    http->Close();
+    // 去掉首尾空白
+    while (!location.empty() && (location.front() == ' ' || location.front() == '\r' || location.front() == '\n')) {
+        location.erase(location.begin());
+    }
+    while (!location.empty() && (location.back() == ' ' || location.back() == '\r' || location.back() == '\n')) {
+        location.pop_back();
+    }
+    // 只接受 http(s) 直链
+    if (location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0) {
+        return location;
+    }
+    return "";
+}
+
+// 提取歌曲名称的关键词处理函数
+static std::string extract_song_keyword(const std::string& input) {
+    std::string result = input;
+
+    // 检查是否存在《》
+    if(input.find("《") != std::string::npos && input.find("》") != std::string::npos) {
+        // 存在书名号，提取里面的内容
+        size_t left_bookmark = input.find("《");
+        size_t right_bookmark = input.find("》");
+        if (left_bookmark != std::string::npos && right_bookmark != std::string::npos && right_bookmark > left_bookmark) {
+            result = input.substr(left_bookmark + 1, right_bookmark - left_bookmark - 1);
+        }
+    }
+    // 不存在书名号，保持原样不变
+    // 移除首尾空格
+    while (!result.empty() && result[0] == ' ') {
+        result.erase(0, 1);
+    }
+    while (!result.empty() && result.back() == ' ') {
+        result.pop_back();
+    }
+
+    // 泛词兜底：大模型常把"播放音乐"直接当成 keyword 传进来（如用户说"播放音乐你看到的我"
+    // 却只传了"音乐"）。用泛词去搜 Meting 会命中热门歌单，第一条几乎总是"卡农"，
+    // 导致每次都播同一首。这里识别泛词并返回空串，让调用方提示用户给出具体歌名。
+    static const char* generic_words[] = {
+        "音乐", "歌曲", "歌", "听歌", "听音乐", "放音乐", "播放音乐",
+        "一首歌", "来首歌", "来一首歌", "放首歌", "放一首歌", "随便",
+        "music", "song", "play music"
+    };
+    for (auto word : generic_words) {
+        if (result == word) {
+            ESP_LOGW(TAG, "Generic music keyword '%s' rejected, need a specific song name", result.c_str());
+            return "";
+        }
+    }
+
+    ESP_LOGI(TAG, "Original keyword: '%s' -> Extracted: '%s'", input.c_str(), result.c_str());
+    return result;
+}
+
+// 某些 Meting 实例的 type=lrc 会返回 JSON 包装：{"lyric":"[00:00.00]...\n..."}
+// 这里统一解包成纯文本 LRC，并还原 \n \" \\ \uXXXX 等转义，保证解析器只看到 \n 分隔的行。
+static std::string extract_lrc_text(const std::string& raw) {
+    size_t first = raw.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos || raw[first] != '{') {
+        return raw;  // 已经是纯文本 LRC
+    }
+    const char* keys[] = {"\"lyric\"", "\"lrc\"", "\"lrcx\""};
+    for (const char* key : keys) {
+        size_t k = raw.find(key);
+        if (k == std::string::npos) continue;
+        size_t colon = raw.find(':', k + strlen(key));
+        if (colon == std::string::npos) continue;
+        size_t q = raw.find('"', colon + 1);
+        if (q == std::string::npos) continue;
+
+        std::string out;
+        out.reserve(raw.size() / 2);
+        for (size_t i = q + 1; i < raw.size(); ++i) {
+            char c = raw[i];
+            if (c == '"') break;
+            if (c != '\\' || i + 1 >= raw.size()) {
+                out += c;
+                continue;
+            }
+            char n = raw[++i];
+            switch (n) {
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'u': {
+                    if (i + 4 >= raw.size()) break;
+                    unsigned code = (unsigned)strtoul(raw.substr(i + 1, 4).c_str(), nullptr, 16);
+                    i += 4;
+                    if (code < 0x80) {
+                        out += (char)code;
+                    } else if (code < 0x800) {
+                        out += (char)(0xC0 | (code >> 6));
+                        out += (char)(0x80 | (code & 0x3F));
+                    } else {
+                        out += (char)(0xE0 | (code >> 12));
+                        out += (char)(0x80 | ((code >> 6) & 0x3F));
+                        out += (char)(0x80 | (code & 0x3F));
+                    }
+                    break;
+                }
+                default: out += n; break;
+            }
+        }
+        if (!out.empty()) {
+            ESP_LOGI(TAG, "Unwrapped JSON lyric payload: %d -> %d bytes",
+                     (int)raw.size(), (int)out.size());
+            return out;
+        }
+    }
+    return raw;
+}
+McpServer::McpServer() {
+}
+
+McpServer::~McpServer() {
+    for (auto tool : tools_) {
+        delete tool;
+    }
+    tools_.clear();
+}
 
 class MCPController {
 public:
@@ -307,6 +544,169 @@ public:
             return std::string(buf);
         }
     );
+
+
+    // ===== my-bot: 音乐点歌工具 =====
+    // 添加音乐搜索和播放工具
+    AddTool("test_search_music",
+        "Search and play a specific song. Use this tool when the user asks to play a song. The keyword MUST be the concrete song name (and optionally the artist), e.g. '晴天 周杰伦', '孤勇者', '卡农'. NEVER pass a generic word like '音乐' or '歌曲' as the keyword - if the user did not tell you a specific song name, ask them which song they want instead of calling this tool. Searches and plays the best matching result.",
+        PropertyList({
+            Property("keyword", kPropertyTypeString, "Music search keyword")
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto keyword = properties["keyword"].value<std::string>();
+            ESP_LOGI(TAG, "Original search keyword: %s", keyword.c_str());
+
+            // 提取歌曲名称关键词
+            std::string extracted_keyword = extract_song_keyword(keyword);
+            if (extracted_keyword.empty()) {
+                // 泛词（如"音乐"）会导致每次都播同一首热门歌曲，这里明确拒绝并引导用户给出歌名
+                ESP_LOGW(TAG, "Empty/generic keyword, asking user for a specific song name");
+                return "{\"success\": false, \"message\": \"你没有告诉我想听哪首歌。请说出具体的歌曲名（可以说「播放《晴天》」或「播放周杰伦的稻香」），我才能帮你播放\"}";
+            }
+            ESP_LOGI(TAG, "Searching for music with extracted keyword: %s", extracted_keyword.c_str());
+
+            std::string encoded_keyword = url_encode(extracted_keyword);
+            auto& board = Board::GetInstance();
+            auto network = board.GetNetwork();
+
+            // ===== Meting 公共音源（网易云）=====
+            // 1) 搜索：liiiu 稳定优先（实测 8/8 命中，含歌手名），失败重试一次，再退 qijieya。
+            //    qijieya 的 search 有速率限制（连续几次后返回空数组），这是之前"搜不到歌"的根因。
+            cJSON* root = nullptr;
+            for (int attempt = 0; attempt < 2 && root == nullptr; ++attempt) {
+                root = meting_search(network, METING_SEARCH_BASE, encoded_keyword);
+            }
+            if (root == nullptr) {
+                ESP_LOGW(TAG, "Primary search exhausted, falling back to backup instance");
+                root = meting_search(network, METING_SEARCH_BACKUP, encoded_keyword);
+            }
+            if (root == nullptr) {
+                ESP_LOGE(TAG, "All Meting search instances failed for keyword: %s", extracted_keyword.c_str());
+                return "{\"success\": false, \"message\": \"搜索音乐失败，请稍后再试\"}";
+            }
+
+            std::string found_music_url;
+            std::string found_song;
+            std::string found_singer;
+            std::string found_id;         // 网易云歌曲 id，用于取完整版直链和歌词
+            std::string lrc_fallback_url; // 搜索结果自带的 lrc 链接（JSON 释放前保存）
+            int count = cJSON_GetArraySize(root);
+            ESP_LOGI(TAG, "Meting search returned %d results", count);
+
+            // 2) 逐个候选：提取 id -> 用 qijieya 取完整版直链（320kbps，不受 search 限流影响）。
+            //    最多尝试前 6 个，避免付费/无版权歌曲（每首多一次 HTTP 请求）拖慢响应。
+            int max_try = count < 6 ? count : 6;
+            for (int i = 0; i < max_try; ++i) {
+                cJSON* item = cJSON_GetArrayItem(root, i);
+                // 兼容 qijieya(name/artist) 与 liiiu(title/author) 两种字段命名
+                std::string song = json_first_string(item, "name", "title");
+                std::string singer = json_first_string(item, "artist", "author");
+                cJSON* api_url = cJSON_GetObjectItem(item, "url");
+                std::string id = extract_meting_id(cJSON_IsString(api_url) ? api_url->valuestring : nullptr);
+                cJSON* lrc = cJSON_GetObjectItem(item, "lrc");
+                if (cJSON_IsString(lrc) && lrc->valuestring && lrc_fallback_url.empty()) {
+                    lrc_fallback_url = lrc->valuestring;
+                }
+
+                std::string direct;
+                if (!id.empty()) {
+                    // 优先 qijieya 取完整版（br=320 由 resolve_meting_url 追加）
+                    std::string stream_api = std::string(METING_STREAM_BASE) +
+                        "?server=netease&type=url&id=" + id;
+                    direct = resolve_meting_url(network, stream_api);
+                }
+                if (direct.empty() && cJSON_IsString(api_url) && api_url->valuestring) {
+                    // 回退：用搜索结果自带 url（可能是 liiiu，部分为试听，总比没有强）
+                    direct = resolve_meting_url(network, api_url->valuestring);
+                }
+                if (direct.empty()) {
+                    ESP_LOGW(TAG, "Meting result %d (%s) has no playable url, trying next", i, song.c_str());
+                    continue;
+                }
+
+                found_music_url = direct;
+                found_song = song;
+                found_singer = singer;
+                found_id = id;
+                ESP_LOGI(TAG, "Candidate %d picked: %s - %s (id=%s)", i, song.c_str(), singer.c_str(), id.c_str());
+                break;  // 找到可用链接
+            }
+            cJSON_Delete(root);
+
+            // 歌词链接：优先用 id 走 qijieya 的 type=lrc（纯文本 LRC），否则退回搜索结果自带链接
+            std::string found_lrc_url;
+            if (!found_id.empty()) {
+                found_lrc_url = std::string(METING_STREAM_BASE) +
+                    "?server=netease&type=lrc&id=" + found_id;
+            } else {
+                found_lrc_url = lrc_fallback_url;
+            }
+
+            if (!found_music_url.empty()) {
+                ESP_LOGI(TAG, "Found playable music: %s - %s", found_song.c_str(), found_singer.c_str());
+                ESP_LOGI(TAG, "Direct MP3 url: %.160s", found_music_url.c_str());
+
+                auto& audio_service = Application::GetInstance().GetAudioService();
+                audio_service.PlayMusicFromUrl(found_music_url);
+
+                // 下载歌词（Meting 的 lrc 接口返回纯文本 LRC），传给 AudioService 驱动显示。
+                // 放在播放启动之后，避免歌词下载延迟拖慢起播；失败不影响音乐。
+                std::string lrc_text;
+                if (!found_lrc_url.empty()) {
+                    auto lrc_http = network->CreateHttp(0);
+                    if (lrc_http->Open("GET", found_lrc_url)) {
+                        auto lrc_status = lrc_http->GetStatusCode();
+                        if (lrc_status && *lrc_status == 200) {
+                            lrc_text = extract_lrc_text(lrc_http->ReadAll());
+                            ESP_LOGI(TAG, "Lyrics downloaded: %d bytes, head: %.60s",
+                                     (int)lrc_text.size(), lrc_text.c_str());
+                        } else {
+                            ESP_LOGW(TAG, "Lyrics download status=%d",
+                                     lrc_status ? *lrc_status : -1);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "Lyrics download open failed");
+                    }
+                    lrc_http->Close();
+                }
+                // 即使没有歌词也调用一次：屏幕至少显示歌名，避免"什么都没有"
+                audio_service.SetLyrics(lrc_text, found_song, found_singer);
+
+                // 音乐播放时用 idle 状态：保持唤醒词开启，允许喊"小智"打断
+                Application::GetInstance().SetDeviceState(kDeviceStateIdle);
+
+                std::string result = "{\"success\": true, \"song\": \"";
+                result += found_song;
+                result += "\", \"artist\": \"";
+                result += found_singer;
+                result += "\", \"message\": \"开始播放音乐\"}";
+                return result;
+            }
+
+            return "{\"success\": false, \"message\": \"搜索音乐失败，没有找到可播放的链接\"}";
+        });
+
+    // 添加音乐控制工具
+    AddTool("control_music",
+        "Control music playback. Use this tool to stop, pause, or control music playback.",
+        PropertyList({
+            Property("action", kPropertyTypeString, "Control action: play, pause, stop, next, previous")
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto action = properties["action"].value<std::string>();
+            auto& audio_service = Application::GetInstance().GetAudioService();
+
+            if (action == "stop") {
+                audio_service.StopMusic();
+                return "{\"success\": true, \"message\": \"音乐已停止\"}";
+            } else if (action == "pause") {
+                audio_service.StopMusic();
+                return "{\"success\": true, \"message\": \"音乐已暂停\"}";
+            } else {
+                return "{\"success\": false, \"message\": \"不支持的操作\"}";
+            }
+        });
 
         ESP_LOGI(TAG, "MCP工具注册完成");
     }

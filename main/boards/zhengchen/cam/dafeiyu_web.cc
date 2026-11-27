@@ -1085,8 +1085,9 @@ std::string LocateByIp() {
         ESP_LOGE(TAG, "定位: 连接 ip-api.com 失败");
         return out;
     }
-    if (http->GetStatusCode() != 200) {
-        ESP_LOGE(TAG, "定位: HTTP %d", http->GetStatusCode());
+    auto locate_status = http->GetStatusCode();
+    if (!locate_status || *locate_status != 200) {
+        ESP_LOGE(TAG, "定位: HTTP %d", locate_status ? *locate_status : -1);
         http->Close();
         return out;
     }

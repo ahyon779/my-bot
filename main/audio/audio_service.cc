@@ -1,4 +1,6 @@
 #include "audio_service.h"
+#include "music_player.h"    // my-bot: MP3 软解播放器
+#include "board.h"           // my-bot: 音乐状态需要通知显示层
 #include <esp_log.h>
 #include <cstring>
 
@@ -882,4 +884,128 @@ bool AudioService::InitializeAudioEngine() {
     audio_engine_initialized_ = true;
     audio_engine_->EnableDeviceAec(device_aec_enabled_);
     return true;
+}
+
+/* ==== my-bot: 音乐播放（去 ADF 化）实现 ==== */
+
+void AudioService::PlayMusicPcm(std::vector<int16_t>& pcm) {
+    if (pcm.empty()) return;
+
+    AudioTask task;
+    task.type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task.pcm = std::move(pcm);
+    task.playback_id = 0;
+    task.timestamp = 0;
+    task.media_position_ms = 0;
+
+    {
+        std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+        // 背压：播放队列容量只有 MAX_PLAYBACK_TASKS_IN_QUEUE(2)，满了就等消费者取走。
+        audio_queue_cv_.wait(lock, [this]() {
+            return !audio_playback_queue_.full() || service_stopped_.load();
+        });
+        if (service_stopped_.load()) return;
+        audio_playback_queue_.push_back(std::move(task));
+    }
+    audio_queue_cv_.notify_all();
+}
+
+void AudioService::UpdateLyric(int position_ms) {
+    if (music_lyric_.empty()) return;
+    // 扣除 DMA/解码缓冲滞后（沿用音乐版经验值）
+    constexpr int kLyricOutputLatencyMs = 120;
+    position_ms -= kLyricOutputLatencyMs;
+    if (position_ms < 0) position_ms = 0;
+
+    int line = music_lyric_.GetLineIndexAt(position_ms);
+    if (line != last_lyric_line_) {
+        last_lyric_line_ = line;
+        if (callbacks_.on_lyric_changed) {
+            callbacks_.on_lyric_changed(
+                line,
+                music_lyric_.GetLineText(line),
+                music_lyric_.GetLineText(line - 1),
+                music_lyric_.GetLineText(line + 1),
+                music_title_, music_artist_);
+        }
+    }
+}
+
+std::string AudioService::GetCurrentLyricLine() const {
+    if (last_lyric_line_ < 0 || (size_t)last_lyric_line_ >= music_lyric_.size()) return "";
+    return music_lyric_.GetLineText(last_lyric_line_);
+}
+
+void AudioService::SetLyrics(const std::string& lrc, const std::string& title,
+                             const std::string& artist) {
+    music_title_ = title;
+    music_artist_ = artist;
+    music_lyric_.Parse(lrc);
+    last_lyric_line_ = -2;
+    // 歌词下载常常晚于起播：先把上一首残留行清掉，再补歌名/歌手。
+    auto display = Board::GetInstance().GetDisplay();
+    if (display != nullptr && (!title.empty() || !artist.empty())) {
+        display->SetMusicTitle(title, artist);
+    }
+    if (callbacks_.on_lyric_changed) {
+        callbacks_.on_lyric_changed(-1, "", "", "", title, artist);
+    }
+    ESP_LOGI(TAG, "Lyrics set: %s - %s, %d lines", title.c_str(), artist.c_str(),
+             (int)music_lyric_.size());
+}
+
+bool AudioService::IsMusicPlaying() {
+    return MusicPlayer::GetInstance().IsPlaying();
+}
+
+void AudioService::PlayMusicFromUrl(const std::string& url, const std::string& lrc,
+                                    const std::string& title, const std::string& artist) {
+    auto& player = MusicPlayer::GetInstance();
+    player.SetOutputSampleRate(codec_ ? codec_->output_sample_rate() : 24000);
+    player.SetPcmCallback([this](std::vector<int16_t>& pcm) {
+        PlayMusicPcm(pcm);
+    });
+    player.SetProgressCallback([this](int pos_ms) {
+        UpdateLyric(pos_ms);
+    });
+    player.SetFinishedCallback([]() {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            display->SetMusicPlaying(false);
+        }
+    });
+
+    // 起播前先让屏幕进入"音乐中"，否则频谱/歌词都会被 music_playing_ 守卫拦掉。
+    auto display = Board::GetInstance().GetDisplay();
+    if (display != nullptr) {
+        if (!title.empty() || !artist.empty()) {
+            display->SetMusicTitle(title, artist);
+        }
+        display->SetMusicPlaying(true);
+        display->SetMusicLyric(-1, "", title, artist);
+    }
+
+    if (!lrc.empty() || !title.empty()) {
+        SetLyrics(lrc, title, artist);
+    }
+    player.PlayUrl(url);
+}
+
+void AudioService::StopMusic() {
+    // 先让屏幕退出音乐态：Stop() 最多可能等解码任务 4 秒，不能让歌词滞留。
+    auto display = Board::GetInstance().GetDisplay();
+    if (display != nullptr) {
+        display->SetMusicPlaying(false);
+    }
+    MusicPlayer::GetInstance().Stop();
+    // 清空播放队列里尚未播完的音乐 PCM（官方 Stop 会连同 TTS 一起清，这里只清队列）
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        audio_playback_queue_.clear();
+        audio_queue_cv_.notify_all();
+    }
+    music_lyric_.Clear();
+    last_lyric_line_ = -2;
+    music_title_.clear();
+    music_artist_.clear();
 }

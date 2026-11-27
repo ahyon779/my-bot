@@ -5,6 +5,8 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
 
 /**
  * 全屏角色（大肥鱼 / 鲸尾女仆）显示层。
@@ -156,7 +158,12 @@ public:
     void CloseClockModeReq() { clock_close_req_ = true; }
     /** MCP 工具 self.music.now：点歌后上报歌名，屏幕顶部显示约 20 秒 */
     void SetSongTitle(const char* title);
-    void SetMusicPlaying(bool on);   /* 2026-11-06 音乐起/停：频谱只认这个标志 */
+    /** 去 ADF 化音乐链路：歌名/歌手由 AudioService 统一喂给显示层 */
+    void SetMusicTitle(const std::string& title, const std::string& artist) override;
+    void SetMusicPlaying(bool on) override;  /* 频谱只认这个标志 */
+    /** LRC 歌词行变化（AudioOutputTask 调用；这里只置请求，LVGL 操作留给 tick） */
+    void SetMusicLyric(int line, const std::string& current,
+                       const std::string& title, const std::string& artist) override;
     /** 板级动作（配网 / 重启）交回板子实现：返回 true 表示已处理并收起菜单。
         参数是菜单项 id（见 MenuItem）。 */
     void SetMenuActionHandler(std::function<bool(int)> handler) { menu_action_ = std::move(handler); }
@@ -501,11 +508,18 @@ private:
     void BuildSpectrum();                 // 只能在 LVGL 线程调
     void UpdateSpectrum();                // tick 里调，内部 40ms 节流
 
-    lv_obj_t* subtitle_label_ = nullptr;  // 屏底字幕（TTS 文本，歌词替代）
+    lv_obj_t* subtitle_label_ = nullptr;  // 屏底字幕（TTS 文本 / LRC 歌词）
     uint32_t subtitle_until_ms_ = 0;      // 0 = 不显示
     lv_obj_t* song_label_ = nullptr;      // 顶部歌名
     uint32_t song_until_ms_ = 0;
     volatile bool music_playing_ = false;   /* 2026-11-06 MCP 上报的音乐播放中 */
+
+    /* my-bot 去 ADF 化：歌词回调跑在 AudioOutputTask，不能碰 LVGL。
+       这里只收文本，OnTick 里统一 ApplyMusicLyricRequest()。 */
+    std::mutex music_lyric_mutex_;
+    std::string pending_music_lyric_text_;
+    bool pending_music_lyric_ = false;
+    void ApplyMusicLyricRequest();        // 只能在 LVGL tick 线程调
 
     /* ── 控制页二维码浮层（菜单「控制页」项打开）── */
     lv_obj_t* qr_root_ = nullptr;         // 全屏深色底

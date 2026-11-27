@@ -96,6 +96,21 @@ void Application::Initialize() {
     callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
         notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
     };
+    // my-bot: LRC 歌词行变化 → 显示层。回调跑在 AudioOutputTask，
+    // DafeiyuDisplay 内部只置请求，真正 LVGL 操作留给 tick。
+    callbacks.on_lyric_changed = [this](int line,
+                                        const std::string& current,
+                                        const std::string& previous,
+                                        const std::string& next,
+                                        const std::string& title,
+                                        const std::string& artist) {
+        (void)previous;
+        (void)next;
+        auto lyric_display = Board::GetInstance().GetDisplay();
+        if (lyric_display != nullptr) {
+            lyric_display->SetMusicLyric(line, current, title, artist);
+        }
+    };
     audio_service_.SetCallbacks(callbacks);
 
     // Load local fonts, images and speech models before starting the network. A pending
@@ -935,6 +950,12 @@ void Application::HandleStopListeningEvent() {
 void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
         return;
+    }
+
+    // my-bot: 音乐播放中被唤醒 → 先停音乐再进对话，保证"停止播放/换一首"能立刻响应
+    if (audio_service_.IsMusicPlaying()) {
+        ESP_LOGI(TAG, "Wake word detected during music playback, stopping music first");
+        audio_service_.StopMusic();
     }
 
     auto state = GetDeviceState();

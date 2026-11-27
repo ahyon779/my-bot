@@ -64,6 +64,20 @@ public:
     virtual bool SupportsGuiOperations() const { return false; }
     // my-bot: 模式选择列表是否激活（zhengchen/cam 的开机菜单用；其他板返回 false）
     virtual bool IsModeSelectActive() const { return false; }
+    // my-bot: 去 ADF 化音乐链路的通用显示钩子；不支持的板型默认空实现。
+    virtual void SetMusicTitle(const std::string& title, const std::string& artist) {
+        (void)title;
+        (void)artist;
+    }
+    virtual void SetMusicPlaying(bool on) { (void)on; }
+    // line = -1 表示前奏/清行；current 是当前歌词行。
+    virtual void SetMusicLyric(int line, const std::string& current,
+                               const std::string& title, const std::string& artist) {
+        (void)line;
+        (void)current;
+        (void)title;
+        (void)artist;
+    }
     virtual void SetHideSubtitle(bool hide) { (void)hide; }
     virtual bool InsertAnimDialog(const char* name, uint32_t duration_ms) {
         (void)name;

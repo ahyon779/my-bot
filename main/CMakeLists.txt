@@ -2,6 +2,8 @@
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_debugger.cc"
             "audio/audio_service.cc"
+            "audio/lyric_parser.cc"       # my-bot: LRC 歌词解析
+            "audio/music_player.cc"       # my-bot: MP3 软解播放器（去 ADF 化）
             "audio/demuxer/ogg_demuxer.cc"
             "notify/notify_player.cc"
             "audio/codecs/no_audio_codec.cc"
