@@ -3703,14 +3703,18 @@ void DafeiyuDisplay::SetSongTitle(const char* title) {
     buf[sizeof(buf) - 1] = '\0';
     /* 2026-11-06 歌名换用 assets 分区的全量字库（font_noto_sans_common_20_4，
        6845 常用字，cbin 格式，Assets::Apply 开机加载进主题）——
-       原来的 basic 静态字体只有 890 字，歌名里生僻字全渲染成方块。 */
+       原来的 basic 静态字体只有 890 字，歌名里生僻字全渲染成方块。
+       my-bot：本地 LRC 不经过服务端 glyph_push，汉字完全依赖本地字库；
+       assets 字库加载失败时显式回退到含中文的 basic，绝不退化成纯拉丁字体。 */
+    const lv_font_t* font = &font_noto_sans_basic_20_4;
     auto theme = static_cast<LvglTheme*>(GetTheme());
     if (theme != nullptr) {
         auto tf = theme->text_font();
         if (tf != nullptr && tf->font() != nullptr) {
-            lv_obj_set_style_text_font(song_label_, tf->font(), 0);
+            font = tf->font();
         }
     }
+    lv_obj_set_style_text_font(song_label_, font, 0);
     lv_label_set_text(song_label_, buf);
     lv_obj_remove_flag(song_label_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(song_label_);
@@ -3795,13 +3799,18 @@ void DafeiyuDisplay::ApplyMusicLyricRequest() {
         lv_obj_add_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    /* my-bot：本地 LRC 歌词不经过服务端 glyph_push，汉字完全依赖本地字库。
+       优先用 assets 分区的 common 全量字库（主题已被 Assets::Apply 替换）；
+       加载失败时显式回退到含中文的 basic，绝不退化成纯拉丁字体。 */
+    const lv_font_t* font = &font_noto_sans_basic_20_4;
     auto theme = static_cast<LvglTheme*>(GetTheme());
     if (theme != nullptr) {
         auto tf = theme->text_font();
         if (tf != nullptr && tf->font() != nullptr) {
-            lv_obj_set_style_text_font(subtitle_label_, tf->font(), 0);
+            font = tf->font();
         }
     }
+    lv_obj_set_style_text_font(subtitle_label_, font, 0);
     lv_label_set_text(subtitle_label_, text.c_str());
     lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(subtitle_label_);
@@ -5406,22 +5415,25 @@ void DafeiyuDisplay::SetChatMessage(const char* role, const char* content) {
     }
 
     /* 2026-11-06 TTS 字幕撤掉（用户明确：说话时不显示文字）。
-       但**歌词恢复**：放音乐时服务端把唱词当作 TTS 文本随音频一起下发
-       （设备端没有独立 LRC 通道），music_playing_ 时显示在屏底，
-       字体用 assets 全量字库（6845 字，之前的方块问题已解决）。
-       一行歌词顶到下一行或音乐结束，不设倒计时。 */
+       但**歌词恢复**：放音乐时服务端把唱词当作 TTS 文本随音频一起下发，
+       music_playing_ 时显示在屏底。my-bot 去 ADF 化后已有独立的本地 LRC
+       通道（AudioService::on_lyric_changed → SetMusicLyric），两条来源共用
+       subtitle_label_；播放本地 MP3 时服务端一般不会下发 TTS 文本，不冲突。
+       字体同样优先 assets 全量字库，失败回退含中文的 basic。 */
     if (role != nullptr && std::strcmp(role, "assistant") == 0 &&
         music_playing_ && subtitle_label_ != nullptr) {
         char buf[160];
         snprintf(buf, sizeof(buf), "%s", content);
         buf[sizeof(buf) - 1] = '\0';
+        const lv_font_t* font = &font_noto_sans_basic_20_4;
         auto theme = static_cast<LvglTheme*>(GetTheme());
         if (theme != nullptr) {
             auto tf = theme->text_font();
             if (tf != nullptr && tf->font() != nullptr) {
-                lv_obj_set_style_text_font(subtitle_label_, tf->font(), 0);
+                font = tf->font();
             }
         }
+        lv_obj_set_style_text_font(subtitle_label_, font, 0);
         lv_label_set_text(subtitle_label_, buf);
         lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(subtitle_label_);
